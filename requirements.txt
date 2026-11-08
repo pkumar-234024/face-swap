@@ -1,0 +1,11 @@
+streamlit>=1.35.0
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
+Pillow>=10.0.0
+insightface>=0.7.3
+onnxruntime>=1.18.0
+torch>=2.3.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+scikit-image>=0.22.0
+ffmpeg-python>=0.2.0
