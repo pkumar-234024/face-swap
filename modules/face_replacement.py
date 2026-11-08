@@ -131,20 +131,26 @@ class FaceReplacementPipeline:
             processed_frame = swapped_frame if swapped_frame is not None else frame
         else:
             # Identity-Conditioned Facial Animation & Direct Delaunay Mesh Warping
-            warped_roi, roi_mask, roi_bbox = self.animation_pipeline.warp_face_to_target(
+            warped_roi, roi_mask, roi_bbox, dst_roi_pts = self.animation_pipeline.warp_face_to_target(
                 source_landmarks=landmarks.points_68,
                 target_frame_shape=(h, w),
                 source_bbox=tracked_bbox,
                 detector_pose=detected_face.get("pose") if detected_face else None,
             )
 
-            # Blend into target frame
-            blend_method = "poisson" if self.settings.get("seamless_blending", True) else "feathered"
+            # Blend into target frame with natural teeth and tongue preservation
+            blend_method = self.settings.get("blend_method", "multiband")
+            if not self.settings.get("seamless_blending", True):
+                blend_method = "feathered"
+
             processed_frame = self.blender.blend_face(
                 target_frame=frame,
                 warped_roi=warped_roi,
                 roi_mask=roi_mask,
                 roi_bbox=roi_bbox,
+                target_landmarks_roi=dst_roi_pts,
+                preserve_mouth_interior=self.settings.get("preserve_mouth_interior", True),
+                enhance_teeth=self.settings.get("enhance_teeth", True),
                 method=blend_method,
             )
 

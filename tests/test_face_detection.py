@@ -121,3 +121,57 @@ def test_head_pose_estimator():
     assert isinstance(pose.yaw, float)
     assert isinstance(pose.roll, float)
 
+
+def test_face_blender_modes_and_teeth_preservation():
+    from modules.face_blending import FaceBlender
+
+    blender = FaceBlender(temporal_smoothing=False)
+    target_frame = np.full((200, 200, 3), 120, dtype=np.uint8)
+    # Bright white square representing teeth in mouth area
+    target_frame[90:110, 90:110] = [255, 255, 255]
+
+    warped_roi = np.full((120, 120, 3), 40, dtype=np.uint8)
+    roi_mask = np.full((120, 120), 255, dtype=np.uint8)
+    roi_bbox = (40, 40, 160, 160)
+
+    # 68 landmarks in ROI space with open mouth (points 60-67)
+    lm_roi = np.full((68, 2), 60.0, dtype=np.float32)
+    lm_roi[60] = [45.0, 60.0]
+    lm_roi[64] = [75.0, 60.0]
+    lm_roi[62] = [60.0, 50.0]
+    lm_roi[66] = [60.0, 70.0]
+    # Set other inner points
+    lm_roi[61] = [52.0, 53.0]
+    lm_roi[63] = [68.0, 53.0]
+    lm_roi[65] = [68.0, 67.0]
+    lm_roi[67] = [52.0, 67.0]
+
+    # Test multiband blend
+    blended_mb = blender.blend_face(
+        target_frame=target_frame,
+        warped_roi=warped_roi,
+        roi_mask=roi_mask,
+        roi_bbox=roi_bbox,
+        target_landmarks_roi=lm_roi,
+        preserve_mouth_interior=True,
+        enhance_teeth=True,
+        method="multiband",
+    )
+    assert blended_mb.shape == (200, 200, 3)
+    # The center of the mouth aperture should preserve high pixel intensity from target_frame teeth
+    assert blended_mb[100, 100, 0] > 180
+
+    # Test poisson blend
+    blended_poisson = blender.blend_face(
+        target_frame=target_frame,
+        warped_roi=warped_roi,
+        roi_mask=roi_mask,
+        roi_bbox=roi_bbox,
+        target_landmarks_roi=lm_roi,
+        preserve_mouth_interior=True,
+        enhance_teeth=False,
+        method="poisson",
+    )
+    assert blended_poisson.shape == (200, 200, 3)
+
+

@@ -269,13 +269,21 @@ with st.expander("🛠️ Advanced Facial Animation & Synchronization Parameters
     with col_s2:
         st.markdown("##### 👄 Eyes & Speech")
         opt_lip_sync = st.toggle("Lip Synchronization", value=True, help="Synchronizes speech articulation, jaw motion, and mouth opening.")
+        opt_teeth = st.toggle("Teeth & Tongue Preservation", value=True, help="Preserves real teeth, tongue, and oral cavity during speaking/singing instead of stretching closed lips.")
         opt_eye_sync = st.toggle("Eye Movement Synchronization", value=True, help="Mirrors pupil gaze orientation and eye aperture.")
         opt_blinking = st.toggle("Blinking Synchronization", value=True, help="Tracks and synchronizes natural blink timing.")
 
     with col_s3:
         st.markdown("##### 🎨 Blending & Realism")
-        opt_lighting = st.toggle("Lighting Correction", value=True, help="CIE LAB color transfer and skin illumination matching.")
-        opt_blending = st.toggle("Seamless Poisson Blending", value=True, help="Poisson cloning and multi-band feathered boundary refinement.")
+        opt_blend_mode = st.selectbox(
+            "Blending Technique",
+            options=["Multi-Band Pyramid (Recommended)", "Poisson Seamless Clone", "Feathered Alpha"],
+            index=0,
+            help="Multi-Band Pyramid decomposes spatial frequencies for natural skin tone fusion without discoloration. Poisson provides gradient cloning.",
+        )
+        opt_lighting = st.toggle("Lighting & Skin Tone Transfer", value=True, help="CIE LAB color transfer and skin illumination matching.")
+        opt_blending = st.toggle("Seamless Skin Integration", value=True, help="Seamlessly blends face boundaries into the neck and forehead.")
+        opt_enhance_teeth = st.toggle("Teeth & Oral Clarity Sharpening", value=True, help="Sharpens dental enamel highlights and tongue texture to avoid video compression softness.")
         opt_temporal = st.toggle("Temporal Smoothing", value=True, help="Exponential moving average filter to eliminate jitter and flickering.")
         opt_audio = st.toggle("Preserve Original Audio", value=True, help="Extracts and preserves sound effects, background music, and speech.")
 
@@ -364,12 +372,15 @@ if start_processing:
     job_settings = {
         "face_replacement": opt_face_replacement,
         "lip_sync": opt_lip_sync,
+        "preserve_mouth_interior": opt_teeth,
+        "enhance_teeth": opt_enhance_teeth,
         "eye_sync": opt_eye_sync,
         "blinking_sync": opt_blinking,
         "expression_sync": opt_expressions,
         "head_movement_sync": opt_head_pose,
         "lighting_correction": opt_lighting,
         "seamless_blending": opt_blending,
+        "blend_method": "multiband" if "Multi-Band" in opt_blend_mode else ("poisson" if "Poisson" in opt_blend_mode else "feathered"),
         "temporal_smoothing": opt_temporal,
         "preserve_audio": opt_audio,
         "output_resolution": opt_resolution,

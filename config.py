@@ -44,7 +44,7 @@ APP_TITLE = "AI Face Replacement & Animation Studio"
 APP_SUBTITLE = "Transform authorized facial identities with AI-powered facial animation."
 APP_DESCRIPTION = (
     "Production-grade facial replacement, expression transfer, head pose tracking, "
-    "lip sync, and eye movement synchronization with strict consent verification and ethical AI disclosure."
+    "lip sync, teeth preservation, and eye movement synchronization with strict consent verification and ethical AI disclosure."
 )
 
 VIDEO_PREVIEW_WIDTH = 640
@@ -60,6 +60,9 @@ DEFAULT_SETTINGS = {
     "head_movement_sync": True,
     "lighting_correction": True,
     "seamless_blending": True,
+    "blend_method": "multiband",
+    "preserve_mouth_interior": True,
+    "enhance_teeth": True,
     "temporal_smoothing": True,
     "preserve_audio": True,
     "output_resolution": "Original",

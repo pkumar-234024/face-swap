@@ -221,7 +221,7 @@ class FacialAnimationPipeline:
         roi_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
         cv2.fillPoly(roi_mask, [roi_hull], 255)
 
-        return warped_roi, roi_mask, (x1, y1, x2, y2)
+        return warped_roi, roi_mask, (x1, y1, x2, y2), dst_roi_pts
 
     def reset(self) -> None:
         self.eye_sync.reset()
