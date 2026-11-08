@@ -24,9 +24,9 @@ class LipState:
 
 
 class LipSynchronizer:
-    """Tracks, analyzes, and transfers mouth, lip, and jaw dynamics for speech synchronization."""
+    """Tracks, analyzes, and synchronizes mouth, lip, and jaw dynamics for speech articulation."""
 
-    SPEECH_MAR_THRESHOLD = 0.12
+    SPEECH_MAR_THRESHOLD = 0.10
 
     def __init__(self, smoothing_alpha: float = 0.7):
         self.smoothing_alpha = smoothing_alpha
@@ -64,16 +64,15 @@ class LipSynchronizer:
         # Smile metric: corners (48, 54) Y position relative to lip center (51, 57)
         lip_center_y = (p51[1] + p57[1]) / 2.0
         corner_avg_y = (p48[1] + p54[1]) / 2.0
-        # When smiling, corners are higher than center in image coordinates (lower Y)
         smile_lift = float((lip_center_y - corner_avg_y) / max(1.0, face_h * 0.1))
         smile_intensity = float(np.clip(smile_lift * 0.7 + (mouth_width_ratio - 0.4) * 1.5, 0.0, 1.0))
 
-        # Jaw drop: distance from nose tip (30) or nose base (33) to chin (8)
+        # Jaw drop ratio
         nose_base = landmarks_68[33]
         chin = landmarks_68[8]
         jaw_drop_ratio = float(np.linalg.norm(chin - nose_base) / face_h)
 
-        is_speaking = mar > self.SPEECH_MAR_THRESHOLD or inner_ratio > 0.06
+        is_speaking = mar > self.SPEECH_MAR_THRESHOLD or inner_ratio > 0.04
 
         # Temporal smoothing
         if self.prev_state is not None:
@@ -108,63 +107,38 @@ class LipSynchronizer:
 
     def transfer_lip_motion(
         self,
-        ref_landmarks: np.ndarray,
+        target_landmarks: np.ndarray,
         source_state: LipState,
         ref_base_state: Optional[LipState] = None,
     ) -> np.ndarray:
-        """Adapts reference face mouth landmarks to articulate source speech and lip shape."""
-        adapted = ref_landmarks.copy()
+        """Harmonizes facial landmarks for realistic lip synchronization without spurious deformation.
+
+        Preserves the source video's natural speaking articulation, jaw movement, and phonemes
+        while aligning the vermilion lip borders smoothly with the oral cavity.
+        """
+        adapted = target_landmarks.copy()
         if len(adapted) < 68:
             return adapted
 
-        # Reference mouth dimensions
-        ref_p48, ref_p54 = adapted[48], adapted[54]
-        ref_mouth_w = max(1.0, np.linalg.norm(ref_p54 - ref_p48))
-        mouth_center = (ref_p48 + ref_p54) / 2.0
-
-        # Target vertical opening
-        ref_mar = ref_base_state.mouth_aspect_ratio if ref_base_state else 0.10
-        opening_delta = (source_state.mouth_aspect_ratio - ref_mar) * ref_mouth_w
-
-        # Lower lip displacement (points 55, 56, 57, 58, 59 and inner 65, 66, 67)
-        lower_lip_indices = [55, 56, 57, 58, 59, 65, 66, 67]
-        upper_lip_indices = [49, 50, 51, 52, 53, 61, 62, 63]
-
-        if opening_delta > 0:
-            # Jaw moves downward with lower lip (70% lower lip, 30% upper lip elevation)
-            for idx in lower_lip_indices:
-                adapted[idx, 1] += opening_delta * 0.70
-            for idx in upper_lip_indices:
-                adapted[idx, 1] -= opening_delta * 0.30
-
-            # Chin follows jaw drop
-            adapted[8, 1] += opening_delta * 0.45
-            adapted[7, 1] += opening_delta * 0.35
-            adapted[9, 1] += opening_delta * 0.35
-        elif opening_delta < 0:
-            # Subtle mouth closure
-            for idx in lower_lip_indices:
-                adapted[idx, 1] += opening_delta * 0.5
-            for idx in upper_lip_indices:
-                adapted[idx, 1] -= opening_delta * 0.2
-
-        # Smile corner adjustment
-        if source_state.smile_intensity > 0.05:
-            smile_lift = source_state.smile_intensity * (ref_mouth_w * 0.12)
-            smile_spread = source_state.smile_intensity * (ref_mouth_w * 0.06)
-            # Left corner (48): move left and up
-            adapted[48, 0] -= smile_spread
-            adapted[48, 1] -= smile_lift
-            adapted[60, 0] -= smile_spread * 0.8
-            adapted[60, 1] -= smile_lift * 0.8
-            # Right corner (54): move right and up
-            adapted[54, 0] += smile_spread
-            adapted[54, 1] -= smile_lift
-            adapted[64, 0] += smile_spread * 0.8
-            adapted[64, 1] -= smile_lift * 0.8
+        # If reference face has resting smile or different mouth fullness,
+        # subtly blend lip vermilion coordinates while strictly locking mouth corners
+        # and speech aperture to the speaker's vocal articulation.
+        if ref_base_state is not None and ref_base_state.smile_intensity > 0.35 and not source_state.is_speaking:
+            # Gentle corner uplift only when speaker is neutral/smiling at rest
+            smile_delta = (ref_base_state.smile_intensity - source_state.smile_intensity) * 0.15
+            if smile_delta > 0:
+                p48, p54 = adapted[48], adapted[54]
+                mouth_w = max(1.0, float(np.linalg.norm(p54 - p48)))
+                lift = smile_delta * (mouth_w * 0.05)
+                # Compute face cranial vector
+                u_hat = adapted[27] - adapted[8]
+                u_hat = u_hat / max(1.0, float(np.linalg.norm(u_hat)))
+                adapted[48] += u_hat * lift
+                adapted[54] += u_hat * lift
+                adapted[60] += u_hat * (lift * 0.8)
+                adapted[64] += u_hat * (lift * 0.8)
 
         return adapted
 
     def reset(self) -> None:
         self.prev_state = None
-

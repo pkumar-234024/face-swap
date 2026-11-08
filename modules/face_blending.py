@@ -87,12 +87,12 @@ class FaceBlender:
             opening_ratio = inner_h / max(1.0, mouth_w)
 
             # When mouth is open for speech or singing, isolate teeth and tongue
-            if opening_ratio > 0.035:
+            if opening_ratio > 0.030:
                 mouth_open = True
                 inner_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
                 cv2.fillPoly(inner_mask, [inner_mouth_pts], 255)
                 # Adaptive feathering kernel scaled to opening height
-                k_m = max(3, (int(inner_h * 0.16) | 1))
+                k_m = max(3, (int(inner_h * 0.18) | 1))
                 feathered_mouth = cv2.GaussianBlur(inner_mask, (k_m, k_m), 0).astype(np.float32) / 255.0
                 feathered_mouth = feathered_mouth[..., None]
 
@@ -148,8 +148,8 @@ class FaceBlender:
             t = target.astype(np.float32) / 255.0
             s = source.astype(np.float32) / 255.0
 
-            # Erode and feather mask for smooth seam transition
-            k = max(5, (min(h, w) // 16) | 1)
+            # Erode and feather mask for smooth seamless boundary transition
+            k = max(9, (min(h, w) // 10) | 1)
             eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
             m_gray = cv2.GaussianBlur(eroded, (k, k), 0).astype(np.float32) / 255.0
             m = np.repeat(m_gray[..., None], 3, axis=2)
@@ -229,9 +229,9 @@ class FaceBlender:
     def _feathered_blend(self, target: np.ndarray, source: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Feathered alpha blending using Gaussian blurred alpha mask."""
         roi_h, roi_w = target.shape[:2]
-        k = max(7, (min(roi_w, roi_h) // 12) | 1)
+        k = max(9, (min(roi_w, roi_h) // 10) | 1)
 
-        # Erode mask slightly before blurring so blend transition occurs at the jaw/temples
+        # Erode mask slightly before blurring so blend transition occurs inside the jaw/temples
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         eroded = cv2.erode(mask, kernel, iterations=1)
 
