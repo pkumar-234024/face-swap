@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import cv2
 import numpy as np
 
@@ -16,8 +18,12 @@ class LightingCorrector:
         source_face: np.ndarray,
         target_lighting: np.ndarray,
         strength: float = 1.0,
+        mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Transfers color distribution in CIE L*a*b* space from target region to source face."""
+        """Transfers color distribution in CIE L*a*b* space from target region to source face.
+
+        If mask is provided, computes statistics strictly on the masked facial skin pixels.
+        """
         if source_face is None or target_lighting is None:
             return source_face
         if source_face.size == 0 or target_lighting.size == 0:
@@ -27,9 +33,22 @@ class LightingCorrector:
         src_lab = cv2.cvtColor(source_face, cv2.COLOR_BGR2LAB).astype(np.float32)
         tgt_lab = cv2.cvtColor(target_lighting, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-        # Compute channel-wise means and standard deviations
-        src_mean, src_std = np.mean(src_lab, axis=(0, 1)), np.std(src_lab, axis=(0, 1)) + 1e-5
-        tgt_mean, tgt_std = np.mean(tgt_lab, axis=(0, 1)), np.std(tgt_lab, axis=(0, 1)) + 1e-5
+        if mask is not None and mask.shape[:2] == source_face.shape[:2] and (mask > 0).sum() > 50:
+            mask_bool = mask > 0
+            src_pixels = src_lab[mask_bool]
+            tgt_pixels = tgt_lab[mask_bool]
+
+            src_mean = np.mean(src_pixels, axis=0, keepdims=True)
+            src_std = np.std(src_pixels, axis=0, keepdims=True) + 1e-5
+
+            tgt_mean = np.mean(tgt_pixels, axis=0, keepdims=True)
+            tgt_std = np.std(tgt_pixels, axis=0, keepdims=True) + 1e-5
+        else:
+            src_mean = np.mean(src_lab, axis=(0, 1), keepdims=True)
+            src_std = np.std(src_lab, axis=(0, 1), keepdims=True) + 1e-5
+
+            tgt_mean = np.mean(tgt_lab, axis=(0, 1), keepdims=True)
+            tgt_std = np.std(tgt_lab, axis=(0, 1), keepdims=True) + 1e-5
 
         # Standardize source and scale by target distribution
         adjusted_lab = ((src_lab - src_mean) / src_std) * tgt_std + tgt_mean
@@ -71,7 +90,7 @@ class LightingCorrector:
     def preserve_skin_texture(
         base_blended: np.ndarray,
         original_face: np.ndarray,
-        texture_ratio: float = 0.25,
+        texture_ratio: float = 0.20,
     ) -> np.ndarray:
         """Injects high-frequency pore and skin details to prevent waxy or plastic appearance."""
         if base_blended.shape != original_face.shape:
@@ -90,4 +109,3 @@ class LightingCorrector:
             0,
         )
         return enhanced
-

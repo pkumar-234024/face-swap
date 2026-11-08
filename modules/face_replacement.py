@@ -114,7 +114,6 @@ class FaceReplacementPipeline:
         # 2. Update tracker for smooth bounding box
         tracked_bbox = self.face_tracker.update(frame, raw_bbox)
         if tracked_bbox is None:
-            # Face not tracked in this frame, return original frame
             return self._apply_watermark(frame)
 
         # 3. Extract landmarks
@@ -131,28 +130,21 @@ class FaceReplacementPipeline:
             swapped_frame = self._run_inswapper(frame, detected_face)
             processed_frame = swapped_frame if swapped_frame is not None else frame
         else:
-            # Identity-Conditioned Facial Animation & Delaunay Mesh Warping
-            animated_face, _ = self.animation_pipeline.animate_face(
+            # Identity-Conditioned Facial Animation & Direct Delaunay Mesh Warping
+            warped_roi, roi_mask, roi_bbox = self.animation_pipeline.warp_face_to_target(
                 source_landmarks=landmarks.points_68,
-                source_frame_shape=(h, w),
+                target_frame_shape=(h, w),
                 source_bbox=tracked_bbox,
                 detector_pose=detected_face.get("pose") if detected_face else None,
             )
 
-            # Crop reference face to face bounding box
-            ref_bx1, ref_by1, ref_bx2, ref_by2 = [int(v) for v in self.ref_face_data["bbox"]]
-            ref_crop = self.ref_image[max(0, ref_by1) : min(self.ref_image.shape[0], ref_by2), max(0, ref_bx1) : min(self.ref_image.shape[1], ref_bx2)]
-            anim_crop = animated_face[max(0, ref_by1) : min(animated_face.shape[0], ref_by2), max(0, ref_bx1) : min(animated_face.shape[1], ref_bx2)]
-
-            replacement_crop = anim_crop if anim_crop.size > 0 else ref_crop
-
             # Blend into target frame
-            blend_method = "poisson" if self.settings.get("seamless_blending", True) else "pyramid"
+            blend_method = "poisson" if self.settings.get("seamless_blending", True) else "feathered"
             processed_frame = self.blender.blend_face(
                 target_frame=frame,
-                replacement_face=replacement_crop,
-                target_bbox=tracked_bbox,
-                target_landmarks=landmarks.points_68,
+                warped_roi=warped_roi,
+                roi_mask=roi_mask,
+                roi_bbox=roi_bbox,
                 method=blend_method,
             )
 
