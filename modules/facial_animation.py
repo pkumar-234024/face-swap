@@ -1,321 +1,277 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+from modules.expression_tracker import ExpressionTracker, FacialExpression
+from modules.eye_sync import EyeState, EyeSynchronizer
+from modules.head_pose import HeadPose, HeadPoseEstimator
+from modules.lip_sync import LipState, LipSynchronizer
+from utils.logging_config import get_logger
+
+logger = get_logger("facial_animation")
+
 
 class FacialAnimationPipeline:
-    def __init__(self, detector, settings: Optional[Dict[str, bool | str]] = None):
-        self.detector = detector
+    """Identity-conditioned facial animation engine using Delaunay Piecewise Affine Warping."""
+
+    def __init__(
+        self,
+        settings: Optional[Dict[str, bool | str]] = None,
+    ):
         self.settings = settings or {
             "face_replacement": True,
             "lip_sync": True,
             "eye_sync": True,
+            "blinking_sync": True,
             "expression_sync": True,
             "head_movement_sync": True,
             "lighting_correction": True,
-            "output_resolution": "Original",
+            "seamless_blending": True,
+            "temporal_smoothing": True,
             "ai_modified_label": True,
         }
-        self.reference_image: Optional[np.ndarray] = None
-        self.reference_face: Optional[np.ndarray] = None
-        self.reference_bbox: Optional[np.ndarray] = None
-        self.reference_kps: Optional[np.ndarray] = None
-        self.reference_motion: Optional[Dict[str, float]] = None
 
-    def load_reference(self, reference_image: np.ndarray) -> None:
-        if reference_image is None or reference_image.size == 0:
+        self.eye_sync = EyeSynchronizer()
+        self.lip_sync = LipSynchronizer()
+        self.expression_tracker = ExpressionTracker()
+        self.head_pose_estimator = HeadPoseEstimator()
+
+        self.ref_image: Optional[np.ndarray] = None
+        self.ref_landmarks: Optional[np.ndarray] = None  # (68, 2)
+        self.ref_bbox: Optional[np.ndarray] = None
+        self.ref_base_lip_state: Optional[LipState] = None
+        self.ref_triangles: Optional[List[Tuple[int, int, int]]] = None
+
+    def load_reference(
+        self,
+        image_bgr: np.ndarray,
+        landmarks_68: np.ndarray,
+        bbox: np.ndarray,
+    ) -> None:
+        """Initializes the authorized reference face identity and computes its base Delaunay mesh."""
+        if image_bgr is None or image_bgr.size == 0:
             raise ValueError("Reference image is empty.")
+        if landmarks_68 is None or len(landmarks_68) < 68:
+            raise ValueError("Reference image requires at least 68 detected facial landmarks.")
 
-        detection = self.detector.detect_best_face(reference_image)
-        if detection is None:
-            raise ValueError("No clear face was detected in the reference image.")
+        self.ref_image = image_bgr.copy()
+        self.ref_landmarks = landmarks_68[:, :2].astype(np.float32)
+        self.ref_bbox = bbox.astype(np.float32)
 
-        bbox = np.asarray(detection["bbox"], dtype=np.float32)
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(reference_image.shape[1], x2)
-        y2 = min(reference_image.shape[0], y2)
+        ref_h = max(1.0, float(bbox[3] - bbox[1]))
+        self.ref_base_lip_state = self.lip_sync.analyze_mouth(self.ref_landmarks, ref_h)
 
-        self.reference_image = reference_image.copy()
-        self.reference_bbox = np.asarray([x1, y1, x2, y2], dtype=np.float32)
-        self.reference_kps = np.asarray(detection["kps"], dtype=np.float32)
-        self.reference_face = reference_image[y1:y2, x1:x2].copy()
+        # Precompute Delaunay Triangles on reference landmarks + boundary anchor points
+        self.ref_triangles = self._compute_delaunay_triangles(self.ref_landmarks, image_bgr.shape[:2])
+        logger.info(
+            "Reference identity loaded successfully. Triangulated into %d mesh facets.",
+            len(self.ref_triangles),
+        )
 
-        if self.reference_face.size == 0:
-            raise ValueError("The reference face crop is empty. Please upload a clearer face image.")
+    def _compute_delaunay_triangles(
+        self,
+        points_68: np.ndarray,
+        img_shape: Tuple[int, int],
+    ) -> List[Tuple[int, int, int]]:
+        """Computes Delaunay triangulation facets for the 68 facial points."""
+        h, w = img_shape[:2]
+        rect = (0, 0, w, h)
+        subdiv = cv2.Subdiv2D(rect)
 
-        self.reference_motion = self.extract_motion(self.reference_bbox, self.reference_kps)
+        # Insert 68 facial points
+        for pt in points_68:
+            px, py = float(pt[0]), float(pt[1])
+            if 0 <= px < w and 0 <= py < h:
+                subdiv.insert((px, py))
 
-    def _safe_point(self, points: np.ndarray, index: int) -> np.ndarray:
-        if points is None or len(points) <= index:
-            return np.array([0.0, 0.0], dtype=np.float32)
-        return np.asarray(points[index], dtype=np.float32)
+        triangle_list = subdiv.getTriangleList()
+        triangles: List[Tuple[int, int, int]] = []
 
-    def extract_motion(self, bbox: np.ndarray, kps: Optional[np.ndarray]) -> Dict[str, float]:
-        x1, y1, x2, y2 = [float(v) for v in bbox]
-        face_w = max(1.0, x2 - x1)
-        face_h = max(1.0, y2 - y1)
-        center_x = (x1 + x2) / 2.0
-        center_y = (y1 + y2) / 2.0
+        for t in triangle_list:
+            pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
+            indices = []
+            valid = True
+            for pt in pts:
+                # Find matching landmark index
+                dists = np.linalg.norm(points_68 - np.array(pt), axis=1)
+                idx = int(np.argmin(dists))
+                if dists[idx] < 1.5:
+                    indices.append(idx)
+                else:
+                    valid = False
+                    break
+            if valid and len(indices) == 3 and len(set(indices)) == 3:
+                triangles.append((indices[0], indices[1], indices[2]))
 
-        motion = {
-            "mouth_open": 0.0,
-            "smile": 0.0,
-            "eye_open": 1.0,
-            "blink": 0.0,
-            "brow_motion": 0.0,
-            "jaw_motion": 0.0,
-            "head_yaw": 0.0,
-            "head_pitch": 0.0,
-            "head_roll": 0.0,
-            "face_width": face_w,
-            "face_height": face_h,
-            "center_x": center_x,
-            "center_y": center_y,
-        }
+        return triangles
 
-        if kps is None or len(kps) == 0:
-            return motion
+    def animate_face(
+        self,
+        source_landmarks: np.ndarray,
+        source_frame_shape: Tuple[int, int],
+        source_bbox: np.ndarray,
+        detector_pose: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Drives the authorized reference identity using source facial motion parameters.
 
-        p0 = self._safe_point(kps, 0)
-        p1 = self._safe_point(kps, 1)
-        p2 = self._safe_point(kps, 2)
-        p3 = self._safe_point(kps, 3)
-        p4 = self._safe_point(kps, 4)
+        Returns:
+            (animated_reference_crop, adapted_landmarks)
+        """
+        if self.ref_image is None or self.ref_landmarks is None:
+            raise RuntimeError("Reference face has not been loaded into animation pipeline.")
 
-        if len(kps) >= 5:
-            mouth_left = p3
-            mouth_right = p4
-            mouth_center = (mouth_left + mouth_right) / 2.0
-            mouth_width = np.linalg.norm(mouth_right - mouth_left)
-            mouth_height = abs(p2[1] - mouth_center[1]) if len(p2) else 0.0
-            mouth_open = np.clip((mouth_height / max(1.0, face_h)) * 5.0, 0.0, 1.0)
-            smile = np.clip((mouth_width / max(1.0, face_w)) * 2.0, 0.0, 1.0)
-            motion["mouth_open"] = mouth_open
-            motion["smile"] = smile
+        pts_src = source_landmarks[:, :2].astype(np.float32)
+        face_size = max(1.0, float(source_bbox[3] - source_bbox[1]))
 
-            eye_mid = (p0 + p1) / 2.0
-            eye_gap = np.linalg.norm(p1 - p0)
-            eye_open = np.clip((eye_gap / max(1.0, face_w)) * 2.5, 0.0, 1.0)
-            motion["eye_open"] = eye_open
+        # 1. Analyze Source Motion
+        eye_state = self.eye_sync.analyze_eyes(pts_src)
+        lip_state = self.lip_sync.analyze_mouth(pts_src, face_size)
+        expression = self.expression_tracker.analyze_expression(pts_src, face_size)
+        head_pose = self.head_pose_estimator.estimate_pose(pts_src, source_frame_shape, detector_pose)
 
-            jaw_motion = np.clip((abs(p2[1] - center_y) / max(1.0, face_h)) * 4.0, 0.0, 1.0)
-            motion["jaw_motion"] = jaw_motion
+        # 2. Condition & Adapt Reference Landmarks
+        adapted_pts = self.ref_landmarks.copy()
 
-            brow_motion = np.clip((abs(p0[1] - p1[1]) / max(1.0, face_h)) * 5.0, 0.0, 1.0)
-            motion["brow_motion"] = brow_motion
+        # Eye & Blinking Synchronization
+        if self.settings.get("eye_sync", True) or self.settings.get("blinking_sync", True):
+            adapted_pts = self.eye_sync.adapt_target_landmarks(adapted_pts, eye_state)
 
-            motion["head_yaw"] = float(np.clip((p2[0] - center_x) / max(1.0, face_w), -1.0, 1.0))
-            motion["head_pitch"] = float(np.clip((center_y - p2[1]) / max(1.0, face_h), -1.0, 1.0))
-            motion["head_roll"] = float(np.clip(np.degrees(np.arctan2(p1[1] - p0[1], p1[0] - p0[0])) / 90.0, -1.0, 1.0))
-
-        if len(kps) >= 68:
-            left_eye = kps[36:42].mean(axis=0)
-            right_eye = kps[45:51].mean(axis=0)
-            eye_dist = np.linalg.norm(right_eye - left_eye)
-            motion["eye_open"] = np.clip((eye_dist / max(1.0, face_w)) * 2.6, 0.0, 1.0)
-            mouth_top = kps[61:68].mean(axis=0)
-            mouth_bottom = kps[57:61].mean(axis=0).mean(axis=0)
-            mouth_height = abs(mouth_top[1] - mouth_bottom[1])
-            motion["mouth_open"] = np.clip((mouth_height / max(1.0, face_h)) * 5.0, 0.0, 1.0)
-            motion["smile"] = np.clip((np.linalg.norm(kps[48] - kps[54]) / max(1.0, face_w)) * 2.0, 0.0, 1.0)
-
-        return motion
-
-    def _color_transfer(self, source: np.ndarray, target: np.ndarray) -> np.ndarray:
-        if source.size == 0 or target.size == 0:
-            return source
-
-        source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
-        target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
-        source_mean = source_lab.mean(axis=(0, 1), keepdims=True)
-        target_mean = target_lab.mean(axis=(0, 1), keepdims=True)
-        source_std = source_lab.std(axis=(0, 1), keepdims=True) + 1e-5
-        target_std = target_lab.std(axis=(0, 1), keepdims=True) + 1e-5
-        adjusted = ((source_lab - source_mean) / source_std) * target_std + target_mean
-        adjusted = np.clip(adjusted, 0, 255)
-        return cv2.cvtColor(adjusted.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-    def _build_face_mask(self, height: int, width: int) -> np.ndarray:
-        mask = np.zeros((height, width), dtype=np.uint8)
-        center = (width // 2, height // 2)
-        axes = (max(30, width // 2), max(30, height // 2))
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-        return cv2.GaussianBlur(mask, (35, 35), 0)
-
-    def _apply_lip_sync(self, face: np.ndarray, motion: Dict[str, float]) -> np.ndarray:
-        if face.size == 0:
-            return face
-
-        h, w = face.shape[:2]
-        mouth_x = int(w * 0.32)
-        mouth_y = int(h * 0.55)
-        mouth_w = int(w * 0.36)
-        mouth_h = int(h * 0.20)
-
-        if mouth_w <= 0 or mouth_h <= 0:
-            return face
-
-        mouth_region = face[mouth_y : mouth_y + mouth_h, mouth_x : mouth_x + mouth_w]
-        if mouth_region.size == 0:
-            return face
-
-        scale = 1.0 + motion.get("mouth_open", 0.0) * 0.7
-        target_h = max(8, int(mouth_h * scale))
-        target_w = max(12, int(mouth_w * (0.9 + motion.get("smile", 0.0) * 0.3)))
-        scaled = cv2.resize(mouth_region, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        overlay = np.zeros_like(face)
-        x1 = max(0, mouth_x)
-        y1 = max(0, mouth_y)
-        x2 = min(w, x1 + target_w)
-        y2 = min(h, y1 + target_h)
-        overlay[y1:y2, x1:x2] = scaled[: y2 - y1, : x2 - x1]
-        alpha = 0.55 * motion.get("mouth_open", 0.0) + 0.15
-        return cv2.addWeighted(face, 1.0 - alpha, overlay, alpha, 0)
-
-    def _apply_eye_sync(self, face: np.ndarray, motion: Dict[str, float]) -> np.ndarray:
-        if face.size == 0:
-            return face
-
-        h, w = face.shape[:2]
-        eye_y = int(h * 0.34)
-        eye_h = max(8, int(h * 0.12))
-        eye_w = max(30, int(w * 0.28))
-        eye_x = int(w * 0.22)
-
-        eye_region = face[eye_y : eye_y + eye_h, eye_x : eye_x + eye_w]
-        if eye_region.size == 0:
-            return face
-
-        eye_alpha = 0.5 * (1.0 - motion.get("eye_open", 1.0))
-        blurred = cv2.GaussianBlur(eye_region, (15, 15), 0)
-        overlay = cv2.addWeighted(eye_region, 1.0 - eye_alpha, blurred, eye_alpha, 0)
-        face = face.copy()
-        face[eye_y : eye_y + eye_h, eye_x : eye_x + eye_w] = overlay
-        return face
-
-    def _apply_expression_sync(self, face: np.ndarray, motion: Dict[str, float]) -> np.ndarray:
-        if face.size == 0:
-            return face
-
-        smile_strength = motion.get("smile", 0.0)
-        if smile_strength <= 0.05:
-            return face
-
-        h, w = face.shape[:2]
-        mouth_x = int(w * 0.35)
-        mouth_y = int(h * 0.58)
-        mouth_w = int(w * 0.30)
-        mouth_h = int(h * 0.18)
-        if mouth_w <= 0 or mouth_h <= 0:
-            return face
-
-        roi = face[mouth_y : mouth_y + mouth_h, mouth_x : mouth_x + mouth_w]
-        if roi.size == 0:
-            return face
-
-        blurred = cv2.GaussianBlur(roi, (9, 9), 0)
-        expression_roi = cv2.addWeighted(roi, 1.0, blurred, smile_strength * 0.25, 0)
-        output = face.copy()
-        output[mouth_y : mouth_y + mouth_h, mouth_x : mouth_x + mouth_w] = expression_roi
-        return output
-
-    def _apply_head_motion(self, face: np.ndarray, motion: Dict[str, float]) -> np.ndarray:
-        if face.size == 0:
-            return face
-
-        h, w = face.shape[:2]
-        yaw = motion.get("head_yaw", 0.0)
-        pitch = motion.get("head_pitch", 0.0)
-        roll = motion.get("head_roll", 0.0)
-
-        center = ((w - 1) / 2.0, (h - 1) / 2.0)
-        scale = 1.0 + abs(yaw) * 0.18 + abs(pitch) * 0.10
-
-        matrix = cv2.getRotationMatrix2D(center, float(roll * 25.0), scale)
-        warped = cv2.warpAffine(face, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        return warped
-
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        if frame is None or frame.size == 0:
-            return frame
-
-        if self.reference_image is None or self.reference_face is None:
-            return frame
-
-        detection = self.detector.detect_best_face(frame)
-        if detection is None:
-            return frame
-
-        bbox = np.asarray(detection["bbox"], dtype=np.float32)
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(frame.shape[1], x2)
-        y2 = min(frame.shape[0], y2)
-
-        if x2 <= x1 or y2 <= y1:
-            return frame
-
-        target_crop = frame[y1:y2, x1:x2]
-        if target_crop.size == 0:
-            return frame
-
-        motion = self.extract_motion(bbox, np.asarray(detection["kps"], dtype=np.float32))
-        face_shape = (y2 - y1, x2 - x1)
-        source_face = cv2.resize(self.reference_face, face_shape[::-1], interpolation=cv2.INTER_CUBIC)
-
-        if self.settings.get("face_replacement", True):
-            output_face = source_face.copy()
-        else:
-            output_face = target_crop.copy()
-
-        if self.settings.get("head_movement_sync", True):
-            output_face = self._apply_head_motion(output_face, motion)
-
-        if self.settings.get("lighting_correction", True):
-            output_face = self._color_transfer(output_face, target_crop)
-
+        # Lip & Speech Synchronization
         if self.settings.get("lip_sync", True):
-            output_face = self._apply_lip_sync(output_face, motion)
-
-        if self.settings.get("eye_sync", True):
-            output_face = self._apply_eye_sync(output_face, motion)
-
-        if self.settings.get("expression_sync", True):
-            output_face = self._apply_expression_sync(output_face, motion)
-
-        mask = self._build_face_mask(face_shape[0], face_shape[1])
-        mask_float = mask.astype(np.float32) / 255.0
-        target_float = target_crop.astype(np.float32)
-        source_float = output_face.astype(np.float32)
-        if target_float.shape != source_float.shape:
-            source_float = cv2.resize(source_float, (target_crop.shape[1], target_crop.shape[0]), interpolation=cv2.INTER_LINEAR)
-        if target_float.shape != mask_float.shape[:2] + (1,):
-            mask_float = cv2.resize(mask_float, (target_crop.shape[1], target_crop.shape[0]), interpolation=cv2.INTER_LINEAR)
-            mask_float = mask_float[..., None]
-        else:
-            mask_float = mask_float[..., None]
-
-        blended = (target_float * (1.0 - mask_float) + source_float * mask_float).astype(np.uint8)
-
-        processed = frame.copy()
-        processed[y1:y2, x1:x2] = blended
-
-        if self.settings.get("ai_modified_label", True):
-            cv2.putText(
-                processed,
-                "AI-MODIFIED",
-                (20, processed.shape[0] - 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
+            adapted_pts = self.lip_sync.transfer_lip_motion(
+                adapted_pts,
+                lip_state,
+                self.ref_base_lip_state,
             )
 
-        return processed
+        # Expression Synchronization (Eyebrows, smile, emotional shifts)
+        if self.settings.get("expression_sync", True):
+            adapted_pts = self.expression_tracker.transfer_expression_to_landmarks(adapted_pts, expression)
+
+        # 3. Piecewise Affine Triangle Mesh Warping
+        warped_face = self._warp_mesh(
+            src_img=self.ref_image,
+            src_pts=self.ref_landmarks,
+            dst_pts=adapted_pts,
+            triangles=self.ref_triangles or [],
+            out_shape=self.ref_image.shape[:2],
+        )
+
+        # 4. Head Pose Orientation Adjustments (perspective / rotation if enabled)
+        if self.settings.get("head_movement_sync", True) and abs(head_pose.roll) > 1.0:
+            h, w = warped_face.shape[:2]
+            center = (w / 2.0, h / 2.0)
+            rot_mat = cv2.getRotationMatrix2D(center, head_pose.roll * 0.7, 1.0)
+            warped_face = cv2.warpAffine(
+                warped_face,
+                rot_mat,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT,
+            )
+            # Transform landmarks
+            ones = np.ones((len(adapted_pts), 1), dtype=np.float32)
+            pts_homo = np.hstack([adapted_pts, ones])
+            adapted_pts = (rot_mat @ pts_homo.T).T
+
+        return warped_face, adapted_pts
+
+    def _warp_mesh(
+        self,
+        src_img: np.ndarray,
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        triangles: List[Tuple[int, int, int]],
+        out_shape: Tuple[int, int],
+    ) -> np.ndarray:
+        """Piecewise affine warping over triangular mesh facets."""
+        h, w = out_shape[:2]
+        output = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # If no triangulation precomputed, fallback to full image
+        if not triangles:
+            return src_img.copy()
+
+        for tri in triangles:
+            idx0, idx1, idx2 = tri
+            t_src = np.float32([src_pts[idx0], src_pts[idx1], src_pts[idx2]])
+            t_dst = np.float32([dst_pts[idx0], dst_pts[idx1], dst_pts[idx2]])
+
+            self._warp_single_triangle(src_img, output, t_src, t_dst)
+
+        # Fill any background regions outside the mesh with source pixels
+        mask = (output > 0).any(axis=-1)
+        output[~mask] = src_img[~mask]
+        return output
+
+    @staticmethod
+    def _warp_single_triangle(
+        img_src: np.ndarray,
+        img_dst: np.ndarray,
+        t_src: np.ndarray,
+        t_dst: np.ndarray,
+    ) -> None:
+        """Warps one triangle from img_src into img_dst using affine bounding box."""
+        r_dst = cv2.boundingRect(t_dst)
+        r_src = cv2.boundingRect(t_src)
+
+        dx, dy, dw, dh = r_dst
+        sx, sy, sw, sh = r_src
+
+        if dw <= 0 or dh <= 0 or sw <= 0 or sh <= 0:
+            return
+
+        # Coordinates relative to bounding boxes
+        t_dst_local = np.array([
+            [t_dst[0][0] - dx, t_dst[0][1] - dy],
+            [t_dst[1][0] - dx, t_dst[1][1] - dy],
+            [t_dst[2][0] - dx, t_dst[2][1] - dy],
+        ], dtype=np.float32)
+
+        t_src_local = np.array([
+            [t_src[0][0] - sx, t_src[0][1] - sy],
+            [t_src[1][0] - sx, t_src[1][1] - sy],
+            [t_src[2][0] - sx, t_src[2][1] - sy],
+        ], dtype=np.float32)
+
+        # Extract source triangle crop
+        src_crop = img_src[max(0, sy) : min(img_src.shape[0], sy + sh), max(0, sx) : min(img_src.shape[1], sx + sw)]
+        if src_crop.size == 0:
+            return
+
+        warp_mat = cv2.getAffineTransform(t_src_local, t_dst_local)
+        warped_crop = cv2.warpAffine(
+            src_crop,
+            warp_mat,
+            (dw, dh),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+        # Triangle raster mask
+        tri_mask = np.zeros((dh, dw), dtype=np.uint8)
+        cv2.fillConvexPoly(tri_mask, t_dst_local.astype(np.int32), 255)
+
+        # Composite into destination
+        dst_y1, dst_y2 = max(0, dy), min(img_dst.shape[0], dy + dh)
+        dst_x1, dst_x2 = max(0, dx), min(img_dst.shape[1], dx + dw)
+
+        crop_h = dst_y2 - dst_y1
+        crop_w = dst_x2 - dst_x1
+        if crop_h <= 0 or crop_w <= 0:
+            return
+
+        sub_mask = tri_mask[:crop_h, :crop_w]
+        sub_warped = warped_crop[:crop_h, :crop_w]
+
+        dst_slice = img_dst[dst_y1:dst_y2, dst_x1:dst_x2]
+        np.copyto(dst_slice, sub_warped, where=sub_mask[..., None] > 0)
+
+    def reset(self) -> None:
+        self.eye_sync.reset()
+        self.lip_sync.reset()
+        self.expression_tracker.reset()
+        self.head_pose_estimator.reset()

@@ -224,5 +224,7 @@ __marimo__/
 uploads/
 outputs/
 temp/
-assets/
-models/
+assets/*
+!assets/css/
+models/*
+!models/README.md

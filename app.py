@@ -1,375 +1,430 @@
 from __future__ import annotations
 
+import asyncio
 import os
-import shutil
-import uuid
+import time
+import warnings
 from pathlib import Path
+from typing import Optional
+
+if os.name == "nt":
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+        if selector_policy is not None:
+            asyncio.set_event_loop_policy(selector_policy())
 
 import cv2
 import numpy as np
-import streamlit as st
 from PIL import Image
+import streamlit as st
 
-from config import APP_DESCRIPTION, APP_TITLE, OUTPUTS_DIR, TEMP_DIR, VIDEO_PREVIEW_WIDTH
-from modules.audio_processor import extract_audio, merge_audio
+from config import (
+    APP_DESCRIPTION,
+    APP_SUBTITLE,
+    APP_TITLE,
+    CRF_PRESETS,
+    DEFAULT_SETTINGS,
+    RESOLUTION_PRESETS,
+    SUPPORTED_IMAGE_EXTENSIONS,
+    SUPPORTED_VIDEO_EXTENSIONS,
+)
 from modules.face_detector import FaceDetector
-from modules.face_replacement import FaceReplacementPipeline
-from modules.face_tracker import FaceTracker
-from modules.facial_animation import FacialAnimationPipeline
-from modules.video_processor import load_video_metadata, process_video
-from utils.file_handler import cleanup_directory, save_uploaded_file
-from utils.helpers import ensure_directory, format_file_size
-from utils.validation import validate_reference_image, validate_video_file, validate_video_file_path
+from modules.processing_pipeline import StudioProcessingPipeline
+from modules.video_analyzer import VideoAnalysisResult, VideoAnalyzer
+from utils.file_handler import cleanup_directory, cleanup_file, save_uploaded_file
+from utils.helpers import format_file_size, format_seconds, get_device
+from utils.logging_config import get_logger
+from utils.model_manager import ModelManager
+from utils.progress_manager import ProgressUpdate
+from utils.validation import (
+    compute_image_sharpness,
+    validate_reference_image,
+    validate_reference_image_path,
+    validate_video_file,
+    validate_video_file_path,
+)
+
+logger = get_logger("app")
+
+# Page Configuration
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🎭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🎥", layout="wide")
+def load_custom_css() -> None:
+    """Injects high-end glassmorphism dark CSS theme."""
+    css_path = Path("assets/css/style.css")
+    if css_path.exists():
+        with open(css_path, "r", encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 
-def inject_css() -> None:
+load_custom_css()
+
+
+@st.cache_resource
+def get_cached_detector() -> FaceDetector:
+    """Initializes and caches FaceDetector engine."""
+    return FaceDetector(device=get_device())
+
+
+@st.cache_resource
+def get_model_status():
+    """Retrieves AI model availability status."""
+    manager = ModelManager()
+    return manager.get_system_status()
+
+
+# Session State Initialization
+if "source_video_path" not in st.session_state:
+    st.session_state.source_video_path = None
+if "reference_image_path" not in st.session_state:
+    st.session_state.reference_image_path = None
+if "video_meta" not in st.session_state:
+    st.session_state.video_meta = None
+if "image_info" not in st.session_state:
+    st.session_state.image_info = None
+if "last_output_video" not in st.session_state:
+    st.session_state.last_output_video = None
+
+
+# -------------------------------------------------------------
+# SIDEBAR: SYSTEM STATUS & CONSENT VERIFICATION
+# -------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### ⚙️ Engine Status")
+    device_mode = get_device()
+    st.markdown(
+        f"<div class='feature-badge'>💻 Compute Device: <b>{device_mode.upper()}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+    models_info = get_model_status()
+    buffalo = models_info.get("buffalo_l", {})
+    if buffalo.get("all_present"):
+        st.success("✅ Buffalo_L Face Models Ready (SCRFD, ArcFace, 68/106 Lmk)")
+    else:
+        st.warning("⚠️ Some Buffalo_L models missing; fallback detector active.")
+
+    inswapper = models_info.get("inswapper", {})
+    if inswapper.get("present"):
+        st.success("✅ Deep InSwapper ONNX Active")
+    else:
+        st.info("ℹ️ Using Mesh Delaunay Animation Engine (InSwapper optional)")
+
+    st.markdown("---")
+    st.markdown("### 🛡️ Consent & Ethical AI")
     st.markdown(
         """
-        <style>
-        :root {
-            --bg: #070b14;
-            --bg-2: #0d1524;
-            --panel: rgba(15, 23, 42, 0.9);
-            --panel-soft: rgba(17, 24, 39, 0.8);
-            --panel-strong: rgba(15, 118, 110, 0.15);
-            --primary: #8b5cf6;
-            --secondary: #22d3ee;
-            --text: #edf2ff;
-            --muted: #a4b0c3;
-            --line: rgba(148, 163, 184, 0.18);
-            --success: #34d399;
-            --danger: #f87171;
-            --shadow: 0 25px 60px rgba(2, 8, 23, 0.55);
-        }
-
-        html, body, [data-testid="stAppViewContainer"], .stApp {
-            background: radial-gradient(circle at top left, rgba(139, 92, 246, 0.26), transparent 32%),
-                        radial-gradient(circle at top right, rgba(34, 211, 238, 0.18), transparent 24%),
-                        linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
-            color: var(--text);
-        }
-
-        .main .block-container {
-            max-width: 1500px;
-            padding-top: 2rem;
-            padding-bottom: 3rem;
-        }
-
-        .hero-card {
-            background: linear-gradient(135deg, rgba(17, 24, 39, 0.95), rgba(30, 41, 59, 0.8));
-            border: 1px solid var(--line);
-            border-radius: 22px;
-            padding: 1.25rem 1.5rem;
-            box-shadow: var(--shadow);
-            margin-bottom: 1.25rem;
-        }
-
-        .eyebrow {
-            display: inline-block;
-            font-size: 0.72rem;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-            color: var(--secondary);
-            font-weight: 700;
-            padding: 0.42rem 0.72rem;
-            border-radius: 999px;
-            background: rgba(34, 211, 238, 0.12);
-            border: 1px solid rgba(34, 211, 238, 0.18);
-            margin-bottom: 0.75rem;
-        }
-
-        h1 {
-            font-size: clamp(2rem, 3vw, 3rem) !important;
-            margin: 0 !important;
-            line-height: 1.1 !important;
-        }
-
-        .subtitle {
-            margin-top: 0.6rem;
-            color: var(--muted);
-            font-size: 1rem;
-        }
-
-        .upload-card,
-        .uploaded-box,
-        .card {
-            background: linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(15, 23, 42, 0.8));
-            border: 1px solid var(--line);
-            border-radius: 20px;
-            padding: 1rem;
-            box-shadow: var(--shadow);
-        }
-
-        div[data-testid="stFileUploader"] section {
-            background: rgba(15, 23, 42, 0.7);
-            border: 1px solid rgba(139, 92, 246, 0.35);
-            border-radius: 16px;
-            padding: 0.35rem;
-        }
-
-        div[data-testid="stFileUploader"] > section > div > div {
-            background: rgba(15, 23, 42, 0.35);
-            border-radius: 12px;
-        }
-
-        .stButton > button {
-            background: linear-gradient(135deg, var(--primary), #7c3aed);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            font-weight: 700;
-            padding: 0.7rem 1.3rem;
-            min-width: 180px;
-            box-shadow: 0 12px 30px rgba(124, 58, 237, 0.35);
-            transition: transform 0.15s ease, box-shadow 0.15s ease;
-        }
-
-        .stButton > button:hover {
-            transform: translateY(-1px);
-            filter: brightness(1.06);
-            box-shadow: 0 15px 35px rgba(124, 58, 237, 0.45);
-        }
-
-        .stButton > button:disabled {
-            background: rgba(148, 163, 184, 0.2);
-            color: rgba(226, 232, 240, 0.55);
-            box-shadow: none;
-            opacity: 0.75;
-        }
-
-        .preview-shell {
-            background: rgba(2, 6, 23, 0.45);
-            border: 1px solid var(--line);
-            border-radius: 18px;
-            padding: 0.5rem;
-            overflow: hidden;
-        }
-
-        .small-text {
-            color: var(--muted);
-            font-size: 0.88rem;
-        }
-
-        .checkbox {
-            background: rgba(15, 23, 42, 0.7);
-            border: 1px solid var(--line);
-            border-radius: 12px;
-            padding: 0.75rem 1rem;
-        }
-
-        .stProgress > div > div {
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
-        }
-
-        .stVideo, .stImage {
-            border-radius: 16px;
-            overflow: hidden;
-        }
-        </style>
+        <div style='font-size: 0.82rem; color: #94a3b8; line-height: 1.45;'>
+        This application requires explicit authorization from any individual whose likeness is uploaded.
+        All exported videos contain an embedded AI-disclosure badge.
+        </div>
         """,
         unsafe_allow_html=True,
     )
 
+    consent_agreed = st.checkbox(
+        "I certify that I have obtained legal consent to use this reference person's likeness and agree to visible AI disclosure.",
+        value=False,
+        key="user_consent_checkbox",
+    )
 
-inject_css()
-
-
-def show_video_metadata(video_path: str) -> None:
-    try:
-        metadata = load_video_metadata(video_path)
-        st.caption(f"Duration: {metadata.duration:.2f}s • Resolution: {metadata.width}x{metadata.height} • FPS: {metadata.fps:.2f}")
-    except Exception:
-        st.caption("Unable to read video metadata.")
-
-
-def preview_image(file_path: str, width: int = 480) -> None:
-    image = Image.open(file_path)
-    st.image(image, width=width, caption="Reference face preview")
-
-
-def validate_user_consent() -> bool:
-    consent = st.checkbox("I confirm that I have permission to use the reference person's likeness and that this use is lawful, consent-based, and not deceptive.", value=False)
-    return consent
+    st.markdown("---")
+    st.markdown("### 🧹 Workspace Management")
+    if st.button("Clear Uploads & Temp Cache", use_container_width=True):
+        cleanup_directory("temp", keep_root=True)
+        st.session_state.source_video_path = None
+        st.session_state.reference_image_path = None
+        st.session_state.video_meta = None
+        st.session_state.image_info = None
+        st.session_state.last_output_video = None
+        st.toast("Temporary files cleaned successfully.")
+        st.rerun()
 
 
-def resolve_output_size(settings: dict | None) -> tuple[int, int] | None:
-    if settings is None:
-        return None
-
-    resolution = settings.get("output_resolution", "Original")
-    if resolution == "720p":
-        return (1280, 720)
-    if resolution == "1080p":
-        return (1920, 1080)
-    return None
-
-
-def run_processing(video_path: str, reference_path: str, progress_container, settings: dict | None = None) -> str:
-    temp_dir = Path(TEMP_DIR) / f"job_{uuid.uuid4().hex[:8]}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    output_video_path = str(Path(OUTPUTS_DIR) / f"processed_{uuid.uuid4().hex[:8]}.mp4")
-    audio_path = str(temp_dir / "audio.aac")
-    output_size = resolve_output_size(settings)
-
-    try:
-        audio_ready_path = extract_audio(video_path, str(audio_path))
-        reference_image = cv2.imread(reference_path)
-        if reference_image is None:
-            raise ValueError("Unable to read the reference image. Please upload a valid JPG, JPEG, or PNG file.")
-
-        detector = FaceDetector()
-        pipeline = FacialAnimationPipeline(detector, settings=settings or {})
-        pipeline.load_reference(reference_image)
-
-        progress_bar = progress_container.progress(0.0)
-
-        def update_progress(value: float) -> None:
-            progress_bar.progress(value)
-
-        process_video(video_path, pipeline, output_video_path, progress_callback=update_progress, target_size=output_size)
-
-        final_output_path = str(Path(OUTPUTS_DIR) / f"final_{uuid.uuid4().hex[:8]}.mp4")
-        merged_path = merge_audio(output_video_path, audio_ready_path, final_output_path)
-        if merged_path and os.path.exists(merged_path):
-            if merged_path != output_video_path:
-                os.replace(merged_path, output_video_path)
-
-        progress_bar.progress(1.0)
-        return output_video_path
-    finally:
-        cleanup_directory(str(temp_dir))
-
-
-def main() -> None:
-    st.markdown("""
-    <div class="hero-card">
-        <div class="eyebrow">Consent-based AI editing</div>
-        <h1>AI Face Replacement Studio</h1>
-        <div class="subtitle">Upload a source video and a reference face to generate a seamless, lawful face replacement preview.</div>
+# -------------------------------------------------------------
+# SECTION 1: HEADER
+# -------------------------------------------------------------
+st.markdown(
+    f"""
+    <div class="hero-header">
+        <span class="hero-pill">Professional AI Studio</span>
+        <h1 class="hero-title">{APP_TITLE}</h1>
+        <p class="hero-subtitle">{APP_SUBTITLE}</p>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-    with st.sidebar:
-        st.subheader("Advanced facial controls")
-        settings = {
-            "face_replacement": st.checkbox("Face Replacement", value=True),
-            "lip_sync": st.checkbox("Lip Synchronization", value=True),
-            "eye_sync": st.checkbox("Eye Synchronization", value=True),
-            "expression_sync": st.checkbox("Facial Expression Synchronization", value=True),
-            "head_movement_sync": st.checkbox("Head Movement Synchronization", value=True),
-            "lighting_correction": st.checkbox("Lighting Correction", value=True),
-            "ai_modified_label": st.checkbox("Label output as AI-modified", value=True),
-            "output_resolution": st.selectbox("Output Resolution", ["Original", "720p", "1080p"], index=0),
-        }
 
-    upload_cols = st.columns(2)
-    with upload_cols[0]:
-        st.markdown('<div class="upload-card">', unsafe_allow_html=True)
-        uploaded_video = st.file_uploader("1. Upload source video", type=["mp4", "mov", "avi"], help="MP4, MOV, or AVI only.")
-        st.markdown('</div>', unsafe_allow_html=True)
+# -------------------------------------------------------------
+# SECTION 2: FILE UPLOAD
+# -------------------------------------------------------------
+st.markdown("### 📂 Upload Media Assets")
+col_upload_vid, col_upload_img = st.columns(2)
 
-    with upload_cols[1]:
-        st.markdown('<div class="upload-card">', unsafe_allow_html=True)
-        reference_image = st.file_uploader("2. Upload reference face image", type=["jpg", "jpeg", "png"], help="JPG, JPEG, or PNG only.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    video_valid = True
-    image_valid = True
-    message = ""
-
+with col_upload_vid:
+    st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+    st.subheader("Panel A: Source Video")
+    uploaded_video = st.file_uploader(
+        "Upload driving video (MP4, MOV, AVI, MKV)",
+        type=[ext.lstrip(".") for ext in SUPPORTED_VIDEO_EXTENSIONS],
+        key="uploader_source_video",
+    )
     if uploaded_video is not None:
-        video_valid, message = validate_video_file(uploaded_video)
-        if not video_valid:
-            st.error(message)
-    if reference_image is not None:
-        image_valid, message = validate_reference_image(reference_image)
-        if not image_valid:
-            st.error(message)
-
-    uploaded_video_path = None
-    uploaded_image_path = None
-
-    preview_cols = st.columns(2)
-    if uploaded_video is not None and uploaded_video.name:
-        with preview_cols[0]:
-            uploaded_video_path = save_uploaded_file(uploaded_video, subdirectory="videos")
-            st.markdown("<div class='uploaded-box preview-shell'>", unsafe_allow_html=True)
-            st.video(uploaded_video_path, format="video/mp4", start_time=0)
-            show_video_metadata(uploaded_video_path)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    if reference_image is not None and reference_image.name:
-        with preview_cols[1]:
-            uploaded_image_path = save_uploaded_file(reference_image, subdirectory="images")
-            st.markdown("<div class='uploaded-box preview-shell'>", unsafe_allow_html=True)
-            preview_image(uploaded_image_path, width=VIDEO_PREVIEW_WIDTH)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='checkbox'>", unsafe_allow_html=True)
-    consent = validate_user_consent()
+        is_valid_vid, vid_err = validate_video_file(uploaded_video)
+        if not is_valid_vid:
+            st.error(vid_err)
+        else:
+            saved_vid_path = save_uploaded_file(uploaded_video, "videos")
+            st.session_state.source_video_path = saved_vid_path
+            # Analyze metadata
+            st.session_state.video_meta = VideoAnalyzer.analyze(saved_vid_path)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='height: 12px'></div>", unsafe_allow_html=True)
-    process_button = st.button("Start Processing", disabled=not (video_valid and image_valid and consent and uploaded_video is not None and reference_image is not None))
+with col_upload_img:
+    st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+    st.subheader("Panel B: Reference Face Image")
+    uploaded_image = st.file_uploader(
+        "Upload authorized face portrait (JPG, PNG, WEBP)",
+        type=[ext.lstrip(".") for ext in SUPPORTED_IMAGE_EXTENSIONS],
+        key="uploader_ref_image",
+    )
+    if uploaded_image is not None:
+        is_valid_img, img_err = validate_reference_image(uploaded_image)
+        if not is_valid_img:
+            st.error(img_err)
+        else:
+            saved_img_path = save_uploaded_file(uploaded_image, "images")
+            st.session_state.reference_image_path = saved_img_path
+            detector = get_cached_detector()
+            _, _, img_info = validate_reference_image_path(saved_img_path, face_detector=detector)
+            st.session_state.image_info = img_info
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    if process_button:
-        if not consent:
-            st.warning("Please confirm consent before processing.")
-            return
 
-        if uploaded_video is None or reference_image is None:
-            st.warning("Please upload both a video and a reference face image before processing.")
-            return
+# -------------------------------------------------------------
+# SECTION 3: VIDEO AND IMAGE PREVIEW
+# -------------------------------------------------------------
+if st.session_state.source_video_path or st.session_state.reference_image_path:
+    st.markdown("### 🔍 Media Preview & Technical Inspection")
+    col_prev_vid, col_prev_img = st.columns(2)
 
-        video_path = uploaded_video_path or save_uploaded_file(uploaded_video, subdirectory="videos")
-        image_path = uploaded_image_path or save_uploaded_file(reference_image, subdirectory="images")
+    with col_prev_vid:
+        st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+        st.markdown("#### Source Video Analysis")
+        if st.session_state.source_video_path and os.path.exists(st.session_state.source_video_path):
+            st.video(st.session_state.source_video_path)
+            meta: Optional[VideoAnalysisResult] = st.session_state.video_meta
+            if meta:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.markdown(f"<div class='metric-box'><div class='metric-value'>{meta.resolution_label.split(' ')[0]}</div><div class='metric-label'>Resolution</div></div>", unsafe_allow_html=True)
+                m2.markdown(f"<div class='metric-box'><div class='metric-value'>{meta.fps}</div><div class='metric-label'>Frame Rate</div></div>", unsafe_allow_html=True)
+                m3.markdown(f"<div class='metric-box'><div class='metric-value'>{meta.duration_formatted}</div><div class='metric-label'>Duration</div></div>", unsafe_allow_html=True)
+                m4.markdown(f"<div class='metric-box'><div class='metric-value'>{meta.file_size_formatted}</div><div class='metric-label'>File Size</div></div>", unsafe_allow_html=True)
+        else:
+            st.info("Upload a video to view playback and technical properties.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        if not os.path.exists(video_path):
-            st.error("The uploaded video file was not saved correctly.")
-            return
-        if not os.path.exists(image_path):
-            st.error("The uploaded reference image was not saved correctly.")
-            return
+    with col_prev_img:
+        st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+        st.markdown("#### Reference Identity Inspection")
+        if st.session_state.reference_image_path and os.path.exists(st.session_state.reference_image_path):
+            st.image(st.session_state.reference_image_path, use_container_width=True)
+            info = st.session_state.image_info
+            if info:
+                i1, i2, i3 = st.columns(3)
+                i1.markdown(f"<div class='metric-box'><div class='metric-value'>{info['width']}x{info['height']}</div><div class='metric-label'>Dimensions</div></div>", unsafe_allow_html=True)
+                i2.markdown(f"<div class='metric-box'><div class='metric-value'>{info['faces_detected']}</div><div class='metric-label'>Faces Detected</div></div>", unsafe_allow_html=True)
+                i3.markdown(f"<div class='metric-box'><div class='metric-value'>{info['sharpness']:.1f}</div><div class='metric-label'>Sharpness</div></div>", unsafe_allow_html=True)
 
-        video_ok, video_error = validate_video_file_path(video_path)
-        if not video_ok:
-            st.error(video_error)
-            return
+                if info.get("warnings"):
+                    for warn in info["warnings"]:
+                        st.warning(warn)
+        else:
+            st.info("Upload a reference face image to inspect portrait quality and landmarks.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        with st.spinner("Analyzing faces and processing the video. This may take a moment..."):
-            progress = st.empty()
-            try:
-                processed_video = run_processing(video_path, image_path, progress, settings=settings)
-            except Exception as exc:
-                st.error(f"Processing failed: {exc}")
-                st.info("Make sure FFmpeg is installed and that its bin folder is added to PATH. On Windows, install it with: winget install Gyan.Dev.FFmpeg")
-                return
 
-        st.success("Processing complete.")
+# -------------------------------------------------------------
+# SECTION 4 & 5: PROCESSING SETTINGS & EXPORT CONFIGURATION
+# -------------------------------------------------------------
+st.markdown("### 🎛️ Studio Configuration & Output Settings")
 
-        st.subheader("Final Output")
-        st.video(processed_video)
+with st.expander("🛠️ Advanced Facial Animation & Synchronization Parameters", expanded=True):
+    col_s1, col_s2, col_s3 = st.columns(3)
 
-        with st.expander("Before and after comparison"):
-            try:
-                before = cv2.imread(image_path)
-                if before is not None:
-                    before_rgb = cv2.cvtColor(before, cv2.COLOR_BGR2RGB)
-                    st.image(before_rgb, caption="Reference face", width=240)
-            except Exception:
-                pass
+    with col_s1:
+        st.markdown("##### 👤 Identity & Motion")
+        opt_face_replacement = st.toggle("Face Replacement", value=True, help="Replaces the primary face with authorized reference identity.")
+        opt_head_pose = st.toggle("Head Movement Synchronization", value=True, help="Tracks 3D head yaw, pitch, roll, and orientation.")
+        opt_expressions = st.toggle("Facial Expression Synchronization", value=True, help="Tracks smiling, eyebrow raising, sadness, and muscle shifts.")
 
-        with open(processed_video, "rb") as video_file:
+    with col_s2:
+        st.markdown("##### 👄 Eyes & Speech")
+        opt_lip_sync = st.toggle("Lip Synchronization", value=True, help="Synchronizes speech articulation, jaw motion, and mouth opening.")
+        opt_eye_sync = st.toggle("Eye Movement Synchronization", value=True, help="Mirrors pupil gaze orientation and eye aperture.")
+        opt_blinking = st.toggle("Blinking Synchronization", value=True, help="Tracks and synchronizes natural blink timing.")
+
+    with col_s3:
+        st.markdown("##### 🎨 Blending & Realism")
+        opt_lighting = st.toggle("Lighting Correction", value=True, help="CIE LAB color transfer and skin illumination matching.")
+        opt_blending = st.toggle("Seamless Poisson Blending", value=True, help="Poisson cloning and multi-band feathered boundary refinement.")
+        opt_temporal = st.toggle("Temporal Smoothing", value=True, help="Exponential moving average filter to eliminate jitter and flickering.")
+        opt_audio = st.toggle("Preserve Original Audio", value=True, help="Extracts and preserves sound effects, background music, and speech.")
+
+with st.expander("📺 Video Export & Quality Settings", expanded=True):
+    col_out1, col_out2, col_out3 = st.columns(3)
+
+    with col_out1:
+        opt_resolution = st.selectbox(
+            "Output Resolution",
+            options=list(RESOLUTION_PRESETS.keys()),
+            index=0,
+            help="Select export resolution preset. Original preserves source video dimensions.",
+        )
+
+    with col_out2:
+        opt_quality = st.selectbox(
+            "Video Compression Quality",
+            options=list(CRF_PRESETS.keys()),
+            index=0,
+            help="High uses CRF 18 (visually lossless), Medium uses CRF 23, Economy uses CRF 28.",
+        )
+
+    with col_out3:
+        opt_watermark = st.toggle(
+            "Visible AI Disclosure Badge",
+            value=True,
+            disabled=True,
+            help="Mandatory ethical disclosure badge ('AI-MODIFIED | CONSENTED LIKENESS') is embedded.",
+        )
+
+
+# -------------------------------------------------------------
+# SECTION 6: PROCESSING BUTTON & VALIDATION GATES
+# -------------------------------------------------------------
+st.markdown("---")
+
+can_process = (
+    st.session_state.source_video_path is not None
+    and st.session_state.reference_image_path is not None
+    and consent_agreed
+)
+
+if not consent_agreed:
+    st.warning("⚠️ Please check the Consent & Ethical AI box in the sidebar before starting processing.")
+
+btn_col1, btn_col2 = st.columns([1, 3])
+with btn_col1:
+    start_processing = st.button(
+        "🚀 START AI PROCESSING",
+        type="primary",
+        disabled=not can_process,
+        use_container_width=True,
+    )
+
+with btn_col2:
+    if not can_process and (st.session_state.source_video_path is None or st.session_state.reference_image_path is None):
+        st.info("Upload both a Source Video and an Authorized Reference Face Image to proceed.")
+
+
+# -------------------------------------------------------------
+# SECTION 7: PROCESSING STATUS & EXECUTION
+# -------------------------------------------------------------
+if start_processing:
+    st.markdown("### ⚡ AI Processing Pipeline in Progress")
+    progress_bar = st.progress(0, text="Initializing processing pipeline...")
+    status_box = st.empty()
+
+    m_stage, m_fps, m_time, m_eta = st.columns(4)
+    with m_stage:
+        metric_stage = st.empty()
+    with m_fps:
+        metric_fps = st.empty()
+    with m_time:
+        metric_time = st.empty()
+    with m_eta:
+        metric_eta = st.empty()
+
+    def update_ui_progress(update: ProgressUpdate) -> None:
+        pct = int(update.percentage)
+        progress_bar.progress(pct, text=f"Stage: {update.stage} ({pct}%) - {update.message}")
+        metric_stage.markdown(f"<div class='metric-box'><div class='metric-value'>{update.current_frame}/{update.total_frames}</div><div class='metric-label'>Frames Processed</div></div>", unsafe_allow_html=True)
+        metric_fps.markdown(f"<div class='metric-box'><div class='metric-value'>{update.fps:.1f}</div><div class='metric-label'>Processing FPS</div></div>", unsafe_allow_html=True)
+        metric_time.markdown(f"<div class='metric-box'><div class='metric-value'>{format_seconds(update.elapsed_seconds)}</div><div class='metric-label'>Elapsed Time</div></div>", unsafe_allow_html=True)
+        metric_eta.markdown(f"<div class='metric-box'><div class='metric-value'>{format_seconds(update.eta_seconds)}</div><div class='metric-label'>Estimated ETA</div></div>", unsafe_allow_html=True)
+
+    job_settings = {
+        "face_replacement": opt_face_replacement,
+        "lip_sync": opt_lip_sync,
+        "eye_sync": opt_eye_sync,
+        "blinking_sync": opt_blinking,
+        "expression_sync": opt_expressions,
+        "head_movement_sync": opt_head_pose,
+        "lighting_correction": opt_lighting,
+        "seamless_blending": opt_blending,
+        "temporal_smoothing": opt_temporal,
+        "preserve_audio": opt_audio,
+        "output_resolution": opt_resolution,
+        "video_quality": opt_quality,
+        "ai_modified_label": True,
+    }
+
+    pipeline = StudioProcessingPipeline(
+        settings=job_settings,
+        progress_callback=update_ui_progress,
+    )
+
+    with st.spinner("Executing identity-conditioned facial animation pipeline..."):
+        result = pipeline.execute(
+            source_video_path=st.session_state.source_video_path,
+            reference_image_path=st.session_state.reference_image_path,
+        )
+
+    if result.success and result.output_video_path and os.path.exists(result.output_video_path):
+        st.session_state.last_output_video = result.output_video_path
+        st.success("🎉 Video generation completed successfully!")
+    else:
+        st.error(f"❌ Processing failed: {result.error_message}")
+
+
+# -------------------------------------------------------------
+# SECTION 8: FINAL RESULT & COMPARISON
+# -------------------------------------------------------------
+if st.session_state.last_output_video and os.path.exists(st.session_state.last_output_video):
+    st.markdown("---")
+    st.markdown("### 🎬 Final Generated Video Result")
+
+    res_col1, res_col2 = st.columns(2)
+
+    with res_col1:
+        st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+        st.markdown("#### 🎯 AI-Modified Video")
+        st.video(st.session_state.last_output_video)
+        with open(st.session_state.last_output_video, "rb") as video_file:
+            video_bytes = video_file.read()
             st.download_button(
-                label="Download Video",
-                data=video_file,
-                file_name="ai_face_replacement_output.mp4",
+                label="⬇️ Download Modified Video (MP4)",
+                data=video_bytes,
+                file_name=Path(st.session_state.last_output_video).name,
                 mime="video/mp4",
+                use_container_width=True,
+                type="primary",
             )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-
-if __name__ == "__main__":
-    main()
+    with res_col2:
+        st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+        st.markdown("#### 📼 Original Source Video Comparison")
+        if st.session_state.source_video_path and os.path.exists(st.session_state.source_video_path):
+            st.video(st.session_state.source_video_path)
+        else:
+            st.info("Original video preview unavailable.")
+        st.markdown("</div>", unsafe_allow_html=True)
