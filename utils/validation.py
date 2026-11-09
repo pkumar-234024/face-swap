@@ -167,7 +167,10 @@ def validate_reference_image_path(image_path: str, face_detector=None) -> Tuple[
     if not image_path or not os.path.exists(image_path):
         return False, "Reference image file not found on disk.", info
 
-    image = cv2.imread(image_path)
+    from utils.file_handler import read_image_bgr
+    image = read_image_bgr(image_path)
+    if image is None or image.size == 0:
+        image = cv2.imread(image_path)
     if image is None or image.size == 0:
         return False, "Image could not be decoded. The file may be corrupt.", info
 

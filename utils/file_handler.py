@@ -104,3 +104,32 @@ def create_job_temp_dir(job_id: Optional[str] = None) -> Path:
     job_dir = TEMP_DIR / f"job_{uid}"
     job_dir.mkdir(parents=True, exist_ok=True)
     return job_dir
+
+
+def read_image_bgr(image_path: str | Path) -> Optional[np.ndarray]:
+    """Safely loads an image in BGR format, auto-orienting EXIF tags and stripping transparency."""
+    if not image_path:
+        return None
+    p = Path(image_path)
+    if not p.exists() or not p.is_file():
+        return None
+
+    try:
+        from PIL import Image, ImageOps
+        import cv2
+        with Image.open(str(p)) as pil_img:
+            # Auto-orient based on camera EXIF tags (solves sideways smartphone portraits)
+            pil_img = ImageOps.exif_transpose(pil_img)
+            # Handle alpha channel (RGBA/PNG/WEBP)
+            if pil_img.mode in ("RGBA", "LA") or (pil_img.mode == "P" and "transparency" in pil_img.info):
+                bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+                if pil_img.mode != "RGBA":
+                    pil_img = pil_img.convert("RGBA")
+                bg.paste(pil_img, mask=pil_img.split()[3])
+                rgb = np.array(bg)
+            else:
+                rgb = np.array(pil_img.convert("RGB"))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        import cv2
+        return cv2.imread(str(p))

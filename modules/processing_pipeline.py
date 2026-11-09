@@ -81,7 +81,10 @@ class StudioProcessingPipeline:
 
             # Stage 2: Load and Verify Reference Identity
             progress.set_stage("Analyzing Reference Face", "Detecting authorized identity, landmarks, and 3D facial mesh...")
-            ref_bgr = cv2.imread(reference_image_path)
+            from utils.file_handler import read_image_bgr
+            ref_bgr = read_image_bgr(reference_image_path)
+            if ref_bgr is None or ref_bgr.size == 0:
+                ref_bgr = cv2.imread(reference_image_path)
             if ref_bgr is None or ref_bgr.size == 0:
                 raise ValueError(f"Unable to read reference face image at {reference_image_path}")
 

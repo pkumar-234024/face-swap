@@ -32,6 +32,7 @@ from config import (
 from modules.face_detector import FaceDetector
 from modules.processing_pipeline import StudioProcessingPipeline
 from modules.video_analyzer import VideoAnalysisResult, VideoAnalyzer
+from modules.video_exporter import VideoExporter
 from utils.file_handler import cleanup_directory, cleanup_file, save_uploaded_file
 from utils.helpers import format_file_size, format_seconds, get_device
 from utils.logging_config import get_logger
@@ -91,6 +92,8 @@ if "image_info" not in st.session_state:
     st.session_state.image_info = None
 if "last_output_video" not in st.session_state:
     st.session_state.last_output_video = None
+if "sbs_video_path" not in st.session_state:
+    st.session_state.sbs_video_path = None
 
 
 # -------------------------------------------------------------
@@ -144,6 +147,7 @@ with st.sidebar:
         st.session_state.video_meta = None
         st.session_state.image_info = None
         st.session_state.last_output_video = None
+        st.session_state.sbs_video_path = None
         st.toast("Temporary files cleaned successfully.")
         st.rerun()
 
@@ -401,29 +405,81 @@ if start_processing:
 
     if result.success and result.output_video_path and os.path.exists(result.output_video_path):
         st.session_state.last_output_video = result.output_video_path
+        # Automatically generate synchronous side-by-side comparison video in ONE frame
+        sbs_target = os.path.join(
+            os.path.dirname(result.output_video_path),
+            f"sbs_{Path(result.output_video_path).name}",
+        )
+        sbs_file = VideoExporter.create_side_by_side_comparison(
+            original_video_path=st.session_state.source_video_path,
+            modified_video_path=result.output_video_path,
+            output_comparison_path=sbs_target,
+        )
+        st.session_state.sbs_video_path = sbs_file if (sbs_file and os.path.exists(sbs_file)) else None
         st.success("🎉 Video generation completed successfully!")
     else:
         st.error(f"❌ Processing failed: {result.error_message}")
 
 
 # -------------------------------------------------------------
-# SECTION 8: FINAL RESULT & COMPARISON
+# SECTION 8: FINAL RESULT & SYNCHRONOUS COMPARISON
 # -------------------------------------------------------------
 if st.session_state.last_output_video and os.path.exists(st.session_state.last_output_video):
     st.markdown("---")
-    st.markdown("### 🎬 Final Generated Video Result")
+    st.markdown("### 🎬 Studio Results & Real-Time Comparison")
 
-    res_col1, res_col2 = st.columns(2)
+    tab_sbs, tab_single, tab_inspect = st.tabs([
+        "📺 Synchronous Dual View (Both in One Frame)",
+        "🎯 Full Resolution AI Video",
+        "🔍 Frame-by-Frame Face Inspector",
+    ])
 
-    with res_col1:
+    with tab_sbs:
         st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
-        st.markdown("#### 🎯 AI-Modified Video")
+        st.markdown("#### 📺 Side-by-Side Real-Time Comparison (100% Synchronous)")
+        st.caption("Both the Original Driving Actor (Left) and AI-Modified Likeness (Right) play synchronously in a single frame.")
+
+        sbs_file = getattr(st.session_state, "sbs_video_path", None)
+        if not sbs_file or not os.path.exists(sbs_file):
+            sbs_target = os.path.join(
+                os.path.dirname(st.session_state.last_output_video),
+                f"sbs_{Path(st.session_state.last_output_video).name}",
+            )
+            sbs_file = VideoExporter.create_side_by_side_comparison(
+                original_video_path=st.session_state.source_video_path,
+                modified_video_path=st.session_state.last_output_video,
+                output_comparison_path=sbs_target,
+            )
+            st.session_state.sbs_video_path = sbs_file
+
+        if sbs_file and os.path.exists(sbs_file):
+            st.video(sbs_file)
+            with open(sbs_file, "rb") as f_sbs:
+                st.download_button(
+                    label="⬇️ Download Side-by-Side Comparison Video (MP4)",
+                    data=f_sbs.read(),
+                    file_name=Path(sbs_file).name,
+                    mime="video/mp4",
+                    use_container_width=True,
+                )
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Original Actor**")
+                st.video(st.session_state.source_video_path)
+            with c2:
+                st.markdown("**AI Modified**")
+                st.video(st.session_state.last_output_video)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with tab_single:
+        st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
+        st.markdown("#### 🎯 Full Resolution AI-Modified Video")
         st.video(st.session_state.last_output_video)
         with open(st.session_state.last_output_video, "rb") as video_file:
-            video_bytes = video_file.read()
             st.download_button(
-                label="⬇️ Download Modified Video (MP4)",
-                data=video_bytes,
+                label="⬇️ Download Full-Res Video (MP4)",
+                data=video_file.read(),
                 file_name=Path(st.session_state.last_output_video).name,
                 mime="video/mp4",
                 use_container_width=True,
@@ -431,11 +487,44 @@ if st.session_state.last_output_video and os.path.exists(st.session_state.last_o
             )
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with res_col2:
+    with tab_inspect:
         st.markdown("<div class='studio-card'>", unsafe_allow_html=True)
-        st.markdown("#### 📼 Original Source Video Comparison")
-        if st.session_state.source_video_path and os.path.exists(st.session_state.source_video_path):
-            st.video(st.session_state.source_video_path)
-        else:
-            st.info("Original video preview unavailable.")
+        st.markdown("#### 🔍 Frame-by-Frame Close-Up Face Inspector")
+        st.caption("Scrub through any video frame to inspect high-definition face crops, lip sync, and teeth detail side-by-side.")
+
+        cap_orig = cv2.VideoCapture(st.session_state.source_video_path)
+        cap_mod = cv2.VideoCapture(st.session_state.last_output_video)
+        total_f = int(min(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT) or 1, cap_mod.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
+
+        if total_f > 1:
+            frame_num = st.slider("Select Video Frame to Inspect", min_value=0, max_value=total_f - 1, value=min(50, total_f - 1))
+            cap_orig.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            cap_mod.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret_o, f_o = cap_orig.read()
+            ret_m, f_m = cap_mod.read()
+
+            if ret_o and ret_m:
+                detector = get_cached_detector()
+                best_face = detector.detect_best_face(f_o)
+                if best_face is not None:
+                    bx1, by1, bx2, by2 = [int(v) for v in best_face["bbox"]]
+                    pad = int(max(bx2 - bx1, by2 - by1) * 0.15)
+                    y1 = max(0, by1 - pad)
+                    y2 = min(f_o.shape[0], by2 + pad)
+                    x1 = max(0, bx1 - pad)
+                    x2 = min(f_o.shape[1], bx2 + pad)
+                    crop_orig = f_o[y1:y2, x1:x2]
+                    crop_mod = f_m[y1:y2, x1:x2]
+                else:
+                    crop_orig = f_o
+                    crop_mod = f_m
+
+                col_io1, col_io2 = st.columns(2)
+                with col_io1:
+                    st.image(cv2.cvtColor(crop_orig, cv2.COLOR_BGR2RGB), caption=f"Original Face (Frame {frame_num})", use_container_width=True)
+                with col_io2:
+                    st.image(cv2.cvtColor(crop_mod, cv2.COLOR_BGR2RGB), caption=f"AI-Modified Face (Frame {frame_num})", use_container_width=True)
+
+        cap_orig.release()
+        cap_mod.release()
         st.markdown("</div>", unsafe_allow_html=True)

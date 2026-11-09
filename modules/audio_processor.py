@@ -50,7 +50,8 @@ def run_ffmpeg(command_args: list[str]) -> subprocess.CompletedProcess[str]:
         full_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -63,8 +64,9 @@ def has_audio_stream(video_path: str) -> bool:
     try:
         cmd = ["-i", video_path]
         res = run_ffmpeg(cmd)
-        # Check stderr for "Audio:"
-        return "Audio:" in res.stderr
+        # Check stderr and stdout for "Audio:"
+        output_text = (res.stderr or "") + (res.stdout or "")
+        return "Audio:" in output_text
     except Exception as exc:
         logger.debug("Error probing audio stream: %s", exc)
         return False

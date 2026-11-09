@@ -90,3 +90,79 @@ class VideoExporter:
             final_output_path=final_output_path,
             crf=crf,
         )
+
+    @classmethod
+    def create_side_by_side_comparison(
+        cls,
+        original_video_path: str,
+        modified_video_path: str,
+        output_comparison_path: str,
+    ) -> Optional[str]:
+        """Generates a synchronous dual-screen comparison video in ONE unified frame.
+
+        Left side displays the Original Driving Actor.
+        Right side displays the AI-Modified Likeness.
+        Both streams play in exact synchronous lockstep with audio in a single player.
+        """
+        if not os.path.exists(original_video_path) or not os.path.exists(modified_video_path):
+            return None
+
+        # Inspect dimensions
+        cap = cv2.VideoCapture(original_video_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1080)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1920)
+        cap.release()
+
+        # Calculate scaled dimensions so combined video fits comfortably in one frame
+        is_portrait = h > w
+        if is_portrait:
+            target_w, target_h = 540, 960
+        else:
+            target_w, target_h = 640, 360
+
+        filter_cmd = (
+            f"[0:v]scale={target_w}:{target_h},drawtext=text='ORIGINAL ACTOR':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.6[v0];"
+            f"[1:v]scale={target_w}:{target_h},drawtext=text='AI-MODIFIED LIKENESS':x=20:y=20:fontsize=24:fontcolor=cyan:box=1:boxcolor=black@0.6[v1];"
+            "[v0][v1]hstack=inputs=2[v]"
+        )
+
+        Path(output_comparison_path).parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "-y",
+            "-i", original_video_path,
+            "-i", modified_video_path,
+            "-filter_complex", filter_cmd,
+            "-map", "[v]",
+            "-map", "1:a?",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "22",
+            "-shortest",
+            output_comparison_path,
+        ]
+
+        res = run_ffmpeg(cmd)
+        if res.returncode == 0 and os.path.exists(output_comparison_path) and os.path.getsize(output_comparison_path) > 100:
+            logger.info("Generated synchronous side-by-side comparison video at %s", output_comparison_path)
+            return output_comparison_path
+
+        # Fallback if drawtext filter is not present
+        simple_filter = f"[0:v]scale={target_w}:{target_h}[v0];[1:v]scale={target_w}:{target_h}[v1];[v0][v1]hstack=inputs=2[v]"
+        fallback_cmd = [
+            "-y",
+            "-i", original_video_path,
+            "-i", modified_video_path,
+            "-filter_complex", simple_filter,
+            "-map", "[v]",
+            "-map", "1:a?",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "22",
+            "-shortest",
+            output_comparison_path,
+        ]
+        fallback_res = run_ffmpeg(fallback_cmd)
+        if fallback_res.returncode == 0 and os.path.exists(output_comparison_path):
+            return output_comparison_path
+
+        return None
